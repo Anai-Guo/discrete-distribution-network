@@ -8,7 +8,7 @@ from random import random
 from collections import namedtuple
 
 import torch
-from torch import nn, arange, tensor, cat
+from torch import nn, arange, tensor, cat, stack
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList
 
@@ -43,6 +43,19 @@ def log(t, eps = 1e-20):
 def gumbel_noise(t):
     noise = torch.rand_like(t)
     return -log(-log(noise))
+
+def l2dist(x1, x2):
+    return (x1 - x2).pow(2).sum(dim = -1).sqrt()
+
+def cdist(x1, x2):
+    is_mps = x1.device.type == 'mps'
+
+    if not is_mps:
+        return torch.cdist(x1, x2)
+
+    dist = l2dist(x1, x2)
+    dist = rearrange(dist, 'b k -> b 1 k')
+    return dist
 
 def pack_one(t, pattern):
     packed, ps = pack([t], pattern)
@@ -131,7 +144,7 @@ class GuidedSampler(Module):
 
         self.codebook_size = codebook_size
         self.to_key_values = Ensemble(network, ensemble_size = codebook_size)
-        self.distance_fn = default(distance_fn, torch.cdist)
+        self.distance_fn = default(distance_fn, cdist)
 
         # chain dropout
 
@@ -674,7 +687,6 @@ from torch.optim import AdamW
 from accelerate import Accelerator
 from torch.utils.data import DataLoader
 
-import torchvision
 from torchvision.utils import save_image
 from torchvision.models import VGG16_Weights
 
@@ -763,15 +775,21 @@ class Trainer(Module):
     def is_main(self):
         return self.accelerator.is_main_process
 
+    @property
+    def unwrapped_model(self):
+        return self.accelerator.unwrap_model(self.model)
+
     def save(self, path):
         if not self.is_main:
             return
 
         save_package = dict(
-            model = self.accelerator.unwrap_model(self.model).state_dict(),
-            ema_model = self.ema_model.state_dict(),
+            model = self.unwrapped_model.state_dict(),
             optimizer = self.optimizer.state_dict(),
         )
+
+        if exists(self.ema_model):
+            save_package['ema_model'] = self.ema_model.state_dict()
 
         torch.save(save_package, str(self.checkpoints_folder / path))
 
@@ -788,8 +806,8 @@ class Trainer(Module):
     def log(self, *args, **kwargs):
         return self.accelerator.log(*args, **kwargs)
 
-    def log_images(self, *args, **kwargs):
-        return self.accelerator.log(*args, **kwargs)
+    def log_images(self, images, **kwargs):
+        return self.log({'samples': images}, **kwargs)
 
     @torch.no_grad()
     def sample(self, fname):
@@ -825,7 +843,7 @@ class Trainer(Module):
             self.optimizer.step()
             self.optimizer.zero_grad()
 
-            self.model.split_and_prune_() # call split and prune after update
+            self.unwrapped_model.split_and_prune_() # call split and prune after update
 
             if self.is_main and self.use_ema:
                 self.ema_model.update()
