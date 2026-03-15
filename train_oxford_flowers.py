@@ -2,7 +2,7 @@
 # dependencies = [
 #   "discrete-distribution-network",
 #   "datasets",
-#   "wandb"
+#   "wandb",
 # ]
 # ///
 
@@ -50,6 +50,8 @@ ddn = DDN(
     dim = 64,
     image_size = IMAGE_SIZE,
     dropout = 0.05,
+    use_adversarial_loss = True,
+    adversarial_loss_weight = 1.0,
     guided_sampler_kwargs = dict(
         crossover_top2_prob = 0.1,
         straight_through_distance_logits = True,
@@ -62,7 +64,8 @@ trainer = Trainer(
     dataset = flowers_dataset,
     num_train_steps = 70_000,
     use_ema = True,
-    batch_size = 32,
+    batch_size = 16,
+    grad_accum_every = 2,
     results_folder = './results'   # samples will be saved periodically to this folder
 )
 

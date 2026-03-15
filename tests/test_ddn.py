@@ -130,4 +130,3 @@ def test_ddn():
     sampled = ddn.sample(batch_size = 1)
 
     assert sampled.shape == (1, 3, 64, 64)
-

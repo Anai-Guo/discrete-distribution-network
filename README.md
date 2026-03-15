@@ -80,12 +80,12 @@ $ uv run train_oxford_flowers.py
 
 ```bibtex
 @misc{yang2025discretedistributionnetworks,
-    title   = {Discrete Distribution Networks}, 
+    title   = {Discrete Distribution Networks},
     author  = {Lei Yang},
     year    = {2025},
     eprint  = {2401.00036},
     archivePrefix = {arXiv},
     primaryClass = {cs.CV},
-    url     = {https://arxiv.org/abs/2401.00036}, 
+    url     = {https://arxiv.org/abs/2401.00036},
 }
 ```

@@ -16,6 +16,7 @@ from einops import rearrange, repeat, einsum, pack, unpack
 from einops.layers.torch import Rearrange, Reduce
 
 from x_mlps_pytorch.ensemble import Ensemble
+from x_transformers.x_transformers import Attention, RMSNorm
 
 # constants
 
@@ -34,6 +35,9 @@ def divisible_by(num, den):
 
 def sample_prob(prob):
     return random() < prob
+
+def leaky_relu(p = 0.1):
+    return nn.LeakyReLU(p)
 
 # tensor helpers
 
@@ -80,6 +84,41 @@ class ChanRMSNorm(Module):
 
     def forward(self, x):
         return F.normalize(x, dim = 1) * (self.gamma + 1.) * self.scale
+
+# gan losses
+
+def hinge_discr_loss(fake, real):
+    return (F.relu(1 + fake) + F.relu(1 - real)).mean()
+
+def hinge_gen_loss(fake):
+    return -fake.mean()
+
+def gradient_penalty(images, output, weight = 10, center = 0.):
+
+    gradients = torch.autograd.grad(
+        outputs = output,
+        inputs = images,
+        grad_outputs = torch.ones_like(output),
+        create_graph = True,
+        retain_graph = True,
+        only_inputs = True
+    )[0]
+
+    gradients = rearrange(gradients, 'b ... -> b (...)')
+    return weight * (gradients.norm(2, dim = 1) - center).pow(2).mean()
+
+def grad_layer_wrt_loss(loss, layer):
+    grad = torch.autograd.grad(
+        outputs = loss,
+        inputs = layer,
+        grad_outputs = torch.ones_like(loss),
+        retain_graph = True,
+        allow_unused = True
+    )[0]
+    return grad.detach() if exists(grad) else torch.zeros_like(layer)
+
+def safe_div(numer, denom, eps = 1e-8):
+    return numer / (denom + eps)
 
 # classes
 
@@ -476,6 +515,124 @@ class ResnetBlock(Module):
         h = self.squeeze_excite(h)
         return h * self.layerscale + res
 
+# discriminator
+
+class DiscriminatorAttention(Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.norm = RMSNorm(dim)
+        self.attn = Attention(dim = dim, dim_head = 64, heads = 8)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        x = rearrange(x, 'b c h w -> b (h w) c')
+        x_norm = self.norm(x)
+        out = self.attn(x_norm)
+        out = rearrange(out, 'b (h w) c -> b c h w', h = h, w = w)
+        return out
+
+class DiscriminatorBlock(Module):
+    def __init__(
+        self,
+        input_channels,
+        filters,
+        downsample = True
+    ):
+        super().__init__()
+        self.conv_res = nn.Conv2d(input_channels, filters, 1, stride = (2 if downsample else 1))
+
+        self.net = Sequential(
+            nn.Conv2d(input_channels, filters, 3, padding=1),
+            leaky_relu(),
+            nn.Conv2d(filters, filters, 3, padding=1),
+            leaky_relu()
+        )
+
+        self.downsample = Sequential(
+            Rearrange('b c (h p1) (w p2) -> b (c p1 p2) h w', p1 = 2, p2 = 2),
+            nn.Conv2d(filters * 4, filters, 1)
+        ) if downsample else None
+
+    def forward(self, x):
+        res = self.conv_res(x)
+        x = self.net(x)
+
+        if exists(self.downsample):
+            x = self.downsample(x)
+
+        x = (x + res) * (1 / math.sqrt(2))
+        return x
+
+class Discriminator(Module):
+    def __init__(
+        self,
+        *,
+        dim,
+        image_size,
+        channels = 3,
+        attn_res_layers = (16,),
+        max_dim = 512
+    ):
+        super().__init__()
+        image_size = (image_size, image_size) if not isinstance(image_size, tuple) else image_size
+        min_image_resolution = min(image_size)
+
+        num_layers = int(math.log2(min_image_resolution) - 2)
+        attn_res_layers = attn_res_layers if isinstance(attn_res_layers, tuple) else (attn_res_layers,) * num_layers
+
+        blocks = []
+
+        layer_dims = [channels] + [(dim * 4) * (2 ** i) for i in range(num_layers + 1)]
+        layer_dims = [min(layer_dim, max_dim) for layer_dim in layer_dims]
+        layer_dims_in_out = tuple(zip(layer_dims[:-1], layer_dims[1:]))
+
+        blocks = []
+        attn_blocks = []
+
+        image_resolution = min_image_resolution
+
+        for ind, (in_chan, out_chan) in enumerate(layer_dims_in_out):
+            num_layer = ind + 1
+            is_not_last = ind != (len(layer_dims_in_out) - 1)
+
+            block = DiscriminatorBlock(in_chan, out_chan, downsample = is_not_last)
+            blocks.append(block)
+
+            attn_block = None
+            if image_resolution in attn_res_layers:
+                attn_block = DiscriminatorAttention(dim = out_chan)
+
+            attn_blocks.append(attn_block)
+
+            image_resolution //= 2
+
+        self.blocks = ModuleList(blocks)
+        self.attn_blocks = ModuleList(attn_blocks)
+
+        dim_last = layer_dims[-1]
+
+        downsample_factor = 2 ** num_layers
+        last_fmap_size = tuple(map(lambda n: n // downsample_factor, image_size))
+
+        latent_dim = last_fmap_size[0] * last_fmap_size[1] * dim_last
+
+        self.to_logits = Sequential(
+            nn.Conv2d(dim_last, dim_last, 3, padding = 1),
+            leaky_relu(),
+            Rearrange('b ... -> b (...)'),
+            nn.Linear(latent_dim, 1),
+            Rearrange('b 1 -> b')
+        )
+
+    def forward(self, x):
+        for block, attn_block in zip(self.blocks, self.attn_blocks):
+            x = block(x)
+
+            if exists(attn_block):
+                x = attn_block(x) + x
+
+        return self.to_logits(x)
+
 class DDN(Module):
     def __init__(
         self,
@@ -487,6 +644,10 @@ class DDN(Module):
         dropout = 0.,
         num_resnet_blocks = 2,
         guided_sampler_kwargs: dict = dict(),
+        use_adversarial_loss = False,
+        adversarial_loss_weight = 1.0,
+        discr_base_dim = 16,
+        discr_attn_res_layers = (16,),
     ):
         super().__init__()
         assert log2(image_size).is_integer()
@@ -547,6 +708,20 @@ class DDN(Module):
                 resnet_block,
                 guided_sampler
             ]))
+
+        # discriminator
+
+        self.use_adversarial_loss = use_adversarial_loss
+        self.adversarial_loss_weight = adversarial_loss_weight
+        self.discr = None
+
+        if use_adversarial_loss:
+            self.discr = Discriminator(
+                image_size = image_size,
+                dim = discr_base_dim,
+                channels = channels,
+                attn_res_layers = discr_attn_res_layers
+            )
 
 
     def guided_sampler_codes_param_names(self):
@@ -614,7 +789,7 @@ class DDN(Module):
 
         self.train(was_training)
 
-        # last sampled output 
+        # last sampled output
 
         if not return_codes:
             return sampled_output
@@ -624,7 +799,9 @@ class DDN(Module):
     def forward(
         self,
         images,
-        return_intermediates = False
+        return_intermediates = False,
+        return_discr_loss = False,
+        apply_grad_penalty = True
     ):
         assert images.shape[1:] == self.input_image_shape
         batch = images.shape[0]
@@ -674,6 +851,45 @@ class DDN(Module):
 
         total_loss = sum(losses)
 
+        # discriminator loss if required
+
+        if return_discr_loss:
+            assert exists(self.discr), 'discriminator must exist to train it'
+            recon_images = sampled_outputs[-1].detach()
+
+            # requires grad for gradient penalty
+            images.requires_grad_()
+
+            recon_discr_logits, real_discr_logits = map(self.discr, (recon_images, images))
+            discr_loss = hinge_discr_loss(recon_discr_logits, real_discr_logits)
+
+            if apply_grad_penalty:
+                gp = gradient_penalty(images, real_discr_logits)
+                discr_loss = discr_loss + gp
+
+            return discr_loss
+
+        # generator loss
+
+        if self.use_adversarial_loss:
+            recon_images = sampled_outputs[-1]
+            gen_loss = hinge_gen_loss(self.discr(recon_images))
+
+            # calculate adaptive weight
+            last_guided_sampler = self.layers[-1][-1]
+            last_dec_layer = next(last_guided_sampler.parameters())
+
+            if exists(last_dec_layer):
+                norm_grad_wrt_gen_loss = grad_layer_wrt_loss(gen_loss, last_dec_layer).norm(p = 2)
+                norm_grad_wrt_recon_loss = grad_layer_wrt_loss(total_loss, last_dec_layer).norm(p = 2)
+
+                adaptive_weight = safe_div(norm_grad_wrt_recon_loss, norm_grad_wrt_gen_loss)
+                adaptive_weight.clamp_(max = 1e4)
+            else:
+                adaptive_weight = 1.0
+
+            total_loss = total_loss + (adaptive_weight * self.adversarial_loss_weight * gen_loss)
+
         if not return_intermediates:
             return total_loss
 
@@ -683,6 +899,7 @@ class DDN(Module):
 
 # trainer
 
+from shutil import rmtree
 from torch.optim import AdamW
 from accelerate import Accelerator
 from torch.utils.data import DataLoader
@@ -707,6 +924,7 @@ class Trainer(Module):
         learning_rate = 3e-4,
         weight_decay = 1e-3,
         batch_size = 32,
+        grad_accum_every = 1,
         checkpoints_folder: str = './checkpoints',
         results_folder: str = './results',
         save_results_every: int = 100,
@@ -716,7 +934,8 @@ class Trainer(Module):
         accelerate_kwargs: dict = dict(),
         ema_kwargs: dict = dict(),
         use_ema = True,
-        max_grad_norm = 0.5
+        max_grad_norm = 0.5,
+        apply_grad_penalty_every = 4
     ):
         super().__init__()
         self.accelerator = Accelerator(**accelerate_kwargs)
@@ -728,6 +947,8 @@ class Trainer(Module):
             ddn = DDN(**ddn)
 
         self.model = ddn
+
+        self.apply_grad_penalty_every = apply_grad_penalty_every
 
         self.use_ema = use_ema
         self.ema_model = None
@@ -744,10 +965,22 @@ class Trainer(Module):
 
         # optimizer, dataloader, and all that
 
-        self.optimizer = AdamW(self.model.parameters(), lr = learning_rate, weight_decay = weight_decay, **adam_kwargs)
+        all_parameters = set(self.model.parameters())
+        discr_parameters = set(self.model.discr.parameters()) if exists(self.model.discr) else set()
+        vae_parameters = all_parameters - discr_parameters
+
+        self.optimizer = AdamW(vae_parameters, lr = learning_rate, weight_decay = weight_decay, **adam_kwargs)
+        if exists(self.model.discr):
+            self.discr_optimizer = AdamW(discr_parameters, lr = learning_rate, weight_decay = weight_decay, **adam_kwargs)
+        else:
+            self.discr_optimizer = None
+
         self.dl = DataLoader(dataset, batch_size = batch_size, shuffle = True, drop_last = True)
 
-        self.model, self.optimizer, self.dl = self.accelerator.prepare(self.model, self.optimizer, self.dl)
+        if exists(self.discr_optimizer):
+            self.model, self.optimizer, self.discr_optimizer, self.dl = self.accelerator.prepare(self.model, self.optimizer, self.discr_optimizer, self.dl)
+        else:
+            self.model, self.optimizer, self.dl = self.accelerator.prepare(self.model, self.optimizer, self.dl)
 
         self.num_train_steps = num_train_steps
 
@@ -755,6 +988,9 @@ class Trainer(Module):
 
         self.checkpoints_folder = Path(checkpoints_folder)
         self.results_folder = Path(results_folder)
+
+        if self.results_folder.exists() and self.is_main:
+            rmtree(str(self.results_folder))
 
         self.checkpoints_folder.mkdir(exist_ok = True, parents = True)
         self.results_folder.mkdir(exist_ok = True, parents = True)
@@ -770,6 +1006,7 @@ class Trainer(Module):
         assert self.results_folder.is_dir()
 
         self.max_grad_norm = max_grad_norm
+        self.grad_accum_every = grad_accum_every
 
     @property
     def is_main(self):
@@ -788,6 +1025,9 @@ class Trainer(Module):
             optimizer = self.optimizer.state_dict(),
         )
 
+        if exists(self.discr_optimizer):
+            save_package['discr_optimizer'] = self.discr_optimizer.state_dict()
+
         if exists(self.ema_model):
             save_package['ema_model'] = self.ema_model.state_dict()
 
@@ -796,12 +1036,18 @@ class Trainer(Module):
     def load(self, path):
         if not self.is_main:
             return
-        
+
         load_package = torch.load(path)
-        
+
         self.model.load_state_dict(load_package["model"])
-        self.ema_model.load_state_dict(load_package["ema_model"])
+
+        if 'ema_model' in load_package and exists(self.ema_model):
+            self.ema_model.load_state_dict(load_package["ema_model"])
+
         self.optimizer.load_state_dict(load_package["optimizer"])
+
+        if 'discr_optimizer' in load_package and exists(self.discr_optimizer):
+            self.discr_optimizer.load_state_dict(load_package["discr_optimizer"])
 
     def log(self, *args, **kwargs):
         return self.accelerator.log(*args, **kwargs)
@@ -814,7 +1060,7 @@ class Trainer(Module):
         eval_model = default(self.ema_model, self.model)
 
         sampled = eval_model.sample(batch_size = self.num_samples)
-      
+
         sampled = rearrange(sampled, '(row col) c h w -> c (row h) (col w)', row = self.num_sample_rows)
         sampled.clamp_(0., 1.)
 
@@ -830,18 +1076,48 @@ class Trainer(Module):
 
             self.model.train()
 
-            data = next(dl)
+            self.optimizer.zero_grad()
+            total_loss = 0.
 
-            loss = self.model(data)
-            self.log(dict(loss = loss.item()), step = step)
+            for _ in range(self.grad_accum_every):
+                data = next(dl)
+                loss = self.model(data)
 
-            self.accelerator.print(f'[{step}] loss: {loss.item():.3f}')
-            self.accelerator.backward(loss)
+                self.accelerator.backward(loss / self.grad_accum_every)
+                total_loss += loss.item() / self.grad_accum_every
 
-            self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            logs = dict(loss = total_loss)
+
+            self.accelerator.print(f'[{step}] loss: {total_loss:.3f}', end = ' | ')
+
+            if exists(self.max_grad_norm):
+                self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
             self.optimizer.step()
-            self.optimizer.zero_grad()
+
+            # discriminator update
+
+            if exists(self.unwrapped_model.discr):
+                self.discr_optimizer.zero_grad()
+                total_discr_loss = 0.
+                apply_grad_penalty = divisible_by(step, self.apply_grad_penalty_every)
+
+                for _ in range(self.grad_accum_every):
+                    data = next(dl)
+                    discr_loss = self.model(data, return_discr_loss = True, apply_grad_penalty = apply_grad_penalty)
+
+                    self.accelerator.backward(discr_loss / self.grad_accum_every)
+                    total_discr_loss += discr_loss.item() / self.grad_accum_every
+
+                if exists(self.max_grad_norm):
+                    self.accelerator.clip_grad_norm_(self.unwrapped_model.discr.parameters(), self.max_grad_norm)
+
+                self.discr_optimizer.step()
+
+                logs['discr_loss'] = total_discr_loss
+                self.accelerator.print(f'discr loss: {total_discr_loss:.3f}', end = '')
+
+            self.log(logs, step = step)
 
             self.unwrapped_model.split_and_prune_() # call split and prune after update
 
