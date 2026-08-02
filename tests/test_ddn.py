@@ -85,6 +85,9 @@ def test_patches(
     # after much training
 
     assert sampler.forward_for_codes(features[:3], codes[:3]).shape == (3, 3, 32, 32)
+    # test scalar code and 1D code with patch_size
+    assert sampler.forward_for_codes(features[:3], tensor(7)).shape == (3, 3, 32, 32)
+    assert sampler.forward_for_codes(features[:3], tensor([3, 5, 2])).shape == (3, 3, 32, 32)
 
 def test_non_image():
     from discrete_distribution_network.ddn import GuidedSampler
@@ -114,6 +117,46 @@ def test_non_image():
 
     assert sampler.forward_for_codes(features[:3], codes[:3]).shape == (3, 16)
 
+def test_separate_values():
+    from discrete_distribution_network.ddn import GuidedSampler
+
+    sampler = GuidedSampler(
+        dim = 16,
+        dim_query = 3,
+        codebook_size = 10,
+        separate_values = True,
+        dim_values = 3,
+        chain_dropout_prob = 0.
+    )
+
+    features = torch.randn(4, 16, 32, 32)
+    query = torch.randn(4, 3, 32, 32)
+    residual = torch.randn(4, 3, 32, 32)
+
+    out, codes, _ = sampler(features, query, residual = residual)
+    assert out.shape == (4, 3, 32, 32)
+
+    ffc_out = sampler.forward_for_codes(features, codes, residual = residual)
+    assert ffc_out.shape == (4, 3, 32, 32)
+    assert torch.allclose(ffc_out, out, atol = 1e-5)
+
+def test_codebook_size_1():
+    from discrete_distribution_network.ddn import GuidedSampler
+
+    sampler = GuidedSampler(
+        dim = 16,
+        dim_query = 3,
+        codebook_size = 1,
+        min_total_count_before_split_prune = 1
+    )
+
+    features = torch.randn(2, 16, 16, 16)
+    query = torch.randn(2, 3, 16, 16)
+
+    out, codes, _ = sampler(features, query)
+    assert out.shape == query.shape
+    sampler.split_and_prune_()
+
 def test_ddn():
     from discrete_distribution_network.ddn import DDN
 
@@ -123,10 +166,13 @@ def test_ddn():
     )
 
     images = torch.randn(2, 3, 64, 64)
-    loss = ddn(images)
+    loss, (codes, intermediate_outputs) = ddn(images, return_intermediates = True)
     loss.backward()
     ddn.split_and_prune_()
 
     sampled = ddn.sample(batch_size = 1)
-
     assert sampled.shape == (1, 3, 64, 64)
+
+    # test sample with custom codes and batch_size = None
+    sampled_codes = ddn.sample(codes = codes)
+    assert sampled_codes.shape == (2, 3, 64, 64)

@@ -66,6 +66,7 @@ trainer = Trainer(
     use_ema = True,
     batch_size = 16,
     grad_accum_every = 2,
+    save_results_every = 100,
     results_folder = './results'   # samples will be saved periodically to this folder
 )
 

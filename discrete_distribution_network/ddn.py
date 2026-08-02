@@ -5,15 +5,26 @@ from math import log2
 from typing import Callable
 from pathlib import Path
 from random import random
+from shutil import rmtree
 from collections import namedtuple
+
+from PIL import Image
 
 import torch
 from torch import nn, arange, tensor, cat, stack
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList
+from torch.optim import AdamW
+from torch.utils.data import DataLoader, Dataset
+
+import torchvision.transforms as T
+from torchvision.utils import save_image
 
 from einops import rearrange, repeat, einsum, pack, unpack
 from einops.layers.torch import Rearrange, Reduce
+
+from accelerate import Accelerator
+from ema_pytorch import EMA
 
 from x_mlps_pytorch.ensemble import Ensemble
 from x_transformers.x_transformers import Attention, RMSNorm
@@ -48,16 +59,16 @@ def gumbel_noise(t):
     noise = torch.rand_like(t)
     return -log(-log(noise))
 
-def l2dist(x1, x2):
-    return (x1 - x2).pow(2).sum(dim = -1).sqrt()
+def l2dist(x1, x2, eps = 1e-12):
+    return (x1 - x2).pow(2).sum(dim = -1).clamp(min = eps).sqrt()
 
-def cdist(x1, x2):
+def cdist(x1, x2, eps = 1e-12):
     is_mps = x1.device.type == 'mps'
 
     if not is_mps:
         return torch.cdist(x1, x2)
 
-    dist = l2dist(x1, x2)
+    dist = l2dist(x1, x2, eps = eps)
     dist = rearrange(dist, 'b k -> b 1 k')
     return dist
 
@@ -223,7 +234,7 @@ class GuidedSampler(Module):
         counts = self.counts
         total_count = counts.sum()
 
-        if total_count < self.min_total_count_before_split_prune:
+        if self.codebook_size < 2 or total_count < self.min_total_count_before_split_prune:
             return
 
         top2_values, top2_indices = counts.topk(2, dim = -1)
@@ -286,13 +297,19 @@ class GuidedSampler(Module):
                 codes = repeat(codes, ' -> b', b = features.shape[0])
 
             features = self.image_to_patches(features)
+            b, h, w = features.shape[:3]
             features, inverse_pack = pack_one(features, '* c h w')
 
             if exists(residual):
                 residual = self.image_to_patches(residual)
                 residual, _ = pack_one(residual, '* c h w')
 
-            codes = repeat(codes, 'b h w -> (b h w)')
+            if codes.ndim == 1:
+                codes = repeat(codes, 'b -> (b h w)', h = h, w = w)
+            elif codes.ndim == 3:
+                codes = rearrange(codes, 'b h w -> (b h w)')
+            else:
+                codes = repeat(codes, '... -> (b h w)', b = b, h = h, w = w)
 
         # if one code, just forward the selected network for all features
         # else each batch is matched with the corresponding code
@@ -301,6 +318,9 @@ class GuidedSampler(Module):
             sel_key_values = self.to_key_values.forward_one(features, id = codes.item())
         else:
             sel_key_values =  self.to_key_values(features, ids = codes, each_batch_sample = True)
+
+        if self.separate_values:
+            sel_key_values = sel_key_values[:, self.dim_query:]
 
         # handle patches
 
@@ -342,23 +362,16 @@ class GuidedSampler(Module):
 
         key_values = self.to_key_values(features)
 
-        # handle residual
+        # get the keys for distance
 
-        if exists(residual):
-            key_values = key_values + residual
-
-        # get the keys
-
-        if self.separate_values:
-            keys, values = key_values[:, :, :self.dim_query], key_values[:, :, self.dim_query:]
-        else:
-            keys, values = key_values, key_values
+        keys = key_values[:, :, :self.dim_query] if self.separate_values else key_values
+        keys_for_dist = keys + residual if exists(residual) else keys
 
         # get the l2 distance
 
         distance = self.distance_fn(
             rearrange(query, 'b ... -> b 1 (...)'),
-            rearrange(keys, 'k b ... -> b k (...)')
+            rearrange(keys_for_dist, 'k b ... -> b k (...)')
         )
 
         distance = rearrange(distance, 'b 1 k -> b k')
@@ -408,6 +421,10 @@ class GuidedSampler(Module):
             sel_keys, sel_values = sel_key_values[:, :self.dim_query], sel_key_values[:, self.dim_query:]
         else:
             sel_keys, sel_values = sel_key_values, sel_key_values
+
+        if exists(residual):
+            sel_keys = sel_keys + residual
+            sel_values = sel_values + residual
 
         # commit loss
 
@@ -756,6 +773,8 @@ class DDN(Module):
 
         assert exists(batch_size) ^ exists(codes)
 
+        batch_size = default(batch_size, codes.shape[0] if exists(codes) else None)
+
         # if only batch size sent in, random codes
 
         if not exists(codes):
@@ -770,7 +789,7 @@ class DDN(Module):
         sampled_output = None
         rgb_residual = None
 
-        for (upsampler, resnet_block, guided_sampler), layer_codes in zip(self.layers, codes.unbind(dim = 1)):
+        for (upsampler, resnet_block, guided_sampler), layer_codes in zip(self.layers, codes.unbind(dim = -1)):
 
             if exists(sampled_output):
                 features = cat((sampled_output, features), dim = 1)
@@ -897,17 +916,33 @@ class DDN(Module):
 
         return total_loss, (codes, sampled_outputs)
 
-# trainer
+# dataset & trainer
 
-from shutil import rmtree
-from torch.optim import AdamW
-from accelerate import Accelerator
-from torch.utils.data import DataLoader
+class ImageDataset(Dataset):
+    def __init__(
+        self,
+        folder,
+        image_size,
+        exts = ('jpg', 'jpeg', 'png', 'tiff', 'webp')
+    ):
+        super().__init__()
+        self.folder = Path(folder)
+        self.image_size = image_size
+        self.paths = [p for ext in exts for p in self.folder.glob(f'**/*.{ext}')]
+        assert len(self.paths) > 0, f'no images found in {folder}'
 
-from torchvision.utils import save_image
-from torchvision.models import VGG16_Weights
+        self.transform = T.Compose([
+            T.Resize((image_size, image_size)),
+            T.ToTensor()
+        ])
 
-from ema_pytorch import EMA
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, index):
+        path = self.paths[index]
+        img = Image.open(path).convert('RGB')
+        return self.transform(img)
 
 def cycle(dl):
     while True:
@@ -1034,12 +1069,9 @@ class Trainer(Module):
         torch.save(save_package, str(self.checkpoints_folder / path))
 
     def load(self, path):
-        if not self.is_main:
-            return
+        load_package = torch.load(path, map_location = self.accelerator.device)
 
-        load_package = torch.load(path)
-
-        self.model.load_state_dict(load_package["model"])
+        self.unwrapped_model.load_state_dict(load_package["model"])
 
         if 'ema_model' in load_package and exists(self.ema_model):
             self.ema_model.load_state_dict(load_package["ema_model"])
@@ -1088,7 +1120,7 @@ class Trainer(Module):
 
             logs = dict(loss = total_loss)
 
-            self.accelerator.print(f'[{step}] loss: {total_loss:.3f}', end = ' | ')
+            print_str = f'[{step}] loss: {total_loss:.3f}'
 
             if exists(self.max_grad_norm):
                 self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -1115,7 +1147,9 @@ class Trainer(Module):
                 self.discr_optimizer.step()
 
                 logs['discr_loss'] = total_discr_loss
-                self.accelerator.print(f'discr loss: {total_discr_loss:.3f}', end = '')
+                print_str += f' | discr loss: {total_discr_loss:.3f}'
+
+            self.accelerator.print(print_str, flush = True)
 
             self.log(logs, step = step)
 
